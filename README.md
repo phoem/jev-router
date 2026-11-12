@@ -37,24 +37,61 @@ To try it without installing, start a session with `claude --plugin-dir "<path t
 
 ## Use
 
-The band above the prompt shows the state with a button for each other mode: **Report only**, **Apply** and **Off**. Click one to switch.
+The band above the prompt shows the state and two buttons. The mode button reads **Mode: Report only** or **Mode: Apply** and flips between the two when clicked. **Turn on** / **Turn off** switches routing on in that mode, or off. Flipping the mode while routing is off only picks it; while it is on, it switches straight away.
+
+Routing is off at the start of every session, so nothing is sent to TypeSafe until you turn it on in that session.
 
 Everything is also a `/jev` command:
 
 | Command | What it does |
 | --- | --- |
-| `/jev on` | Turns routing on for this session, in the default mode (report unless you changed it) |
-| `/jev report` | Shows the model Jev would pick for each prompt and changes nothing |
-| `/jev apply` | Runs each turn on the picked model |
+| `/jev on` | Turns routing on for this session, in the mode last picked (the `defaultMode` setting until you pick one) |
+| `/jev report` | Picks report mode and turns routing on: shows the model Jev would pick for each prompt and changes nothing |
+| `/jev apply` | Picks apply mode and turns routing on: runs each turn on the picked model |
 | `/jev off` | Turns it off: nothing more is sent to TypeSafe |
 | `/jev status` | Shows the current state |
+| `/jev usage` | Reports what the router's lookups have used at TypeSafe (see below) |
+| `/jev usage money` / `tokens` / `limits` / `hide` | Shows one TypeSafe figure, or hides it (hidden by default) |
+| `/jev debug show` / `/jev debug hide` | Shows Jev's raw answer for the last lookup, or hides it (hidden by default) |
+| `/jev details top` / `/jev details status` | Where those two show: as rows on the top band (the default), or after the routing text on the status line |
 | `/jev topband show` / `/jev topband hide` | Shows or hides the band above the prompt (shown by default) |
 | `/jev statusband show` / `/jev statusband hide` | Shows or hides the status line under the prompt (hidden by default) |
 | `/jev help` | Lists these commands, the current state and the settings in use. A bare `/jev` does the same |
 
 The same words without the slash (`jev on`, `jev off` and so on) also work when typed as a prompt on their own, but the desktop app then shows "A hook blocked your prompt" beside the result. Use the slash form to avoid that.
 
-The band and the status line show the same text, for example `Jev: off`, `Jev: on (report only) · would pick sonnet` or `Jev: on (routing) · this turn runs on haiku`. Which of the two is shown is remembered across sessions. Routing itself always starts off in a new session.
+The band and the status line show the same routing text, for example `Jev: off`, `Jev: on (report) → sonnet` or `Jev: on (apply) → haiku`. The arrow points at the model Jev picked: in report mode the one it would pick, in apply mode the one the turn runs on. A failed lookup reads `Jev: on (apply) · no pick: <reason>`.
+
+The debug values and the usage figure are the details. By default they show as rows under the routing text on the top band, which is full width and wraps. The desktop app draws the status line as one short line beside the model name, so a long one is cut off with "…" and shown in full only when you hover over it; it does not show line breaks. If you prefer the status line anyway, `/jev details status` puts the details after the routing text there, separated by `|`. What is shown is remembered across sessions. Routing itself always starts off in a new session.
+
+### Usage
+
+All the usage figures are TypeSafe's (Jev's), not Claude's. `/jev usage` prints them, one fact a line:
+
+```
+TypeSafe (Jev) usage, counting this router's lookups only:
+This session: 12 requests, 8292 input tokens, 600 output tokens, about $0.000348
+All sessions: 340 requests, 235000 input tokens, 17000 output tokens, about $0.009870
+Rate-limited by TypeSafe: 0 times this session, 2 times in all
+Cost is an estimate at $0.042 per million input tokens; output tokens are free (docs.typesafe.ai/models).
+What is left: TypeSafe's API reports no balance or limit figures. Rate limits are set per organization and shown at console.typesafe.ai/rate-limits.
+```
+
+- **What is counted:** only the lookups this router makes, taken from the token counts TypeSafe returns with each answer. Other use of the same API key is not included. "All sessions" is kept in the mod's saved data and adds up across sessions, including ones open at the same time.
+- **Cost:** input tokens times the published price, which is a constant at the top of `hooks/display.ts`. Update it if TypeSafe's price changes. It is an estimate, not an invoice.
+- **What is left:** TypeSafe's API (`/v1/models` and `/v1/systemone` are all it has) returns no balance, quota or rate-limit figures, so the router cannot show how much you have left. Your organization's limits are in TypeSafe's developer console.
+
+`money` shows the estimated cost, `tokens` the input tokens, and `limits` how many requests TypeSafe rate-limited (HTTP 429), each for this session and for all sessions. The figure updates after each lookup.
+
+### Debug values
+
+With `/jev debug show`, Jev's answer for the last lookup is added to the details:
+
+```
+depth 1.09, confidence 0.84, p 0/91/9/0% · stakes 0.28 · follow-up 0.02 · level 1
+```
+
+`depth` is the Score's position on levels 0 to 3, `confidence` how concentrated its probabilities are, and `p` the probability of each level. `stakes` and `follow-up` are Nouls, each a single probability, so they have no separate confidence. `level` is what the policy made of them.
 
 ## Settings
 
@@ -104,8 +141,9 @@ The tests in `tests/` run the mod against the engine with TypeSafe mocked, so th
 
 | File | What it holds |
 | --- | --- |
-| `hooks/register.ts` | The hooks: the toggle, the lookup, the status line, the model rewrite |
+| `hooks/register.tsx` | The hooks: the commands, the lookup, the band and status line, the model rewrite |
 | `hooks/policy.ts` | The Jev questions and the level-to-model policy |
+| `hooks/display.ts` | The text of the routing line, the usage figures and the debug values |
 | `types/index.d.ts` | The session state the mod keeps |
 | `.claude-plugin/plugin.json` | The manifest and the two settings |
 | `.claude-plugin/marketplace.json` | Makes this folder installable as a marketplace |

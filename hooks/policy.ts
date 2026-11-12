@@ -21,7 +21,33 @@ const LEVELS = [
 
 export type Turn = { role: 'user' | 'assistant'; text: string }
 
-export type Judgments = { depth: number; stakes: number; followUp: number }
+// `confidence` and `probabilities` describe the depth Score and are shown, not
+// used by the policy.
+export type Judgments = {
+  depth: number
+  stakes: number
+  followUp: number
+  confidence?: number
+  probabilities?: number[]
+}
+
+export type Tokens = { input: number; output: number }
+
+// What a request was billed for, read from any answered request.
+export const parseUsage = (body: string): Tokens | undefined => {
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+
+  const { input_tokens: input, output_tokens: output } =
+    (parsed as { usage?: Record<string, unknown> } | null)?.usage ?? {}
+
+  return typeof input === 'number' && typeof output === 'number' ? { input, output } : undefined
+}
 
 export type Decision = { level: number; model: string }
 
@@ -74,7 +100,25 @@ export const parseAnswers = (body: string): Judgments | undefined => {
   const followUp = answers?.follow_up?.noul
   const isDepth = typeof depth === 'number' && depth >= 0 && depth <= LEVELS.length - 1
 
-  return isDepth && isUnit(stakes) && isUnit(followUp) ? { depth, stakes, followUp } : undefined
+  if (!isDepth || !isUnit(stakes) || !isUnit(followUp)) {
+    return undefined
+  }
+
+  // The rest is for display: an answer without it still routes.
+  const judged: Judgments = { depth, stakes, followUp }
+  const confidence = answers?.depth?.confidence
+  const spread = answers?.depth?.probabilities as Record<string, unknown> | undefined
+  const probabilities = LEVELS.map((_, level) => spread?.[String(level)])
+
+  if (isUnit(confidence)) {
+    judged.confidence = confidence
+  }
+
+  if (probabilities.every(isUnit)) {
+    judged.probabilities = probabilities
+  }
+
+  return judged
 }
 
 export const parseModels = (setting: string): string[] => {
