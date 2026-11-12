@@ -1,0 +1,6 @@
+{
+  "name": "jev-router",
+  "description": "Per-prompt Claude model routing judged by TypeSafe's Jev.",
+  "owner": { "name": "Jordan Newman" },
+  "plugins": [{ "name": "jev-router", "source": "./" }]
+}

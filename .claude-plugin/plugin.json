@@ -1,0 +1,22 @@
+{
+  "name": "jev-router",
+  "version": "0.1.0",
+  "description": "Asks TypeSafe's Jev how hard each prompt is and picks the Claude model for that turn. Off until you type 'jev on' in a session.",
+  "author": { "name": "Jordan Newman" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "defaultMode": {
+      "type": "string",
+      "title": "Mode that 'jev on' starts",
+      "description": "report shows the model Jev would pick and changes nothing. apply runs each turn on the picked model.",
+      "default": "report",
+      "options": ["report", "apply"]
+    },
+    "models": {
+      "type": "string",
+      "title": "Models by difficulty",
+      "description": "Comma-separated, easiest first: the model for difficulty level 0, 1, 2 and 3. Aliases or full model ids. With fewer than four, the last one covers the higher levels.",
+      "default": "haiku,sonnet,opus,fable"
+    }
+  }
+}
