@@ -1,6 +1,6 @@
 # jev-router
 
-A Claude Code mod that asks [TypeSafe](https://docs.typesafe.ai)'s Jev model how hard each prompt is and picks the Claude model for that turn. It is off until you turn it on in a session, and a status line under the prompt shows whether it is on and what it picked.
+A Claude Code mod that asks [TypeSafe](https://docs.typesafe.ai)'s Jev model how hard each prompt is and picks the Claude model for that turn. It is off until you turn it on in a session, and a band above the prompt shows whether it is on and what it picked.
 
 ## Requirements
 
@@ -39,17 +39,20 @@ To try it without installing, start a session with `claude --plugin-dir "<path t
 
 The band above the prompt shows the state with a button for each other mode: **Report only**, **Apply** and **Off**. Click one to switch.
 
-You can also type one of these as a prompt on its own. The mod answers it and nothing is sent to the model; the desktop app labels such a prompt "A hook blocked your prompt", which is expected. `/jev on` and the other forms work too where slash commands are available.
+Everything is also a `/jev` command:
 
-| Prompt | What it does |
+| Command | What it does |
 | --- | --- |
-| `jev on` | Turns routing on for this session, in the default mode (report unless you changed it) |
-| `jev report` | Shows the model Jev would pick for each prompt and changes nothing |
-| `jev apply` | Runs each turn on the picked model |
-| `jev off` | Turns it off: nothing more is sent to TypeSafe |
-| `jev status` | Shows the current state |
-| `jev topband show` / `jev topband hide` | Shows or hides the band above the prompt (shown by default) |
-| `jev statusband show` / `jev statusband hide` | Shows or hides the status line under the prompt (hidden by default) |
+| `/jev on` | Turns routing on for this session, in the default mode (report unless you changed it) |
+| `/jev report` | Shows the model Jev would pick for each prompt and changes nothing |
+| `/jev apply` | Runs each turn on the picked model |
+| `/jev off` | Turns it off: nothing more is sent to TypeSafe |
+| `/jev status` | Shows the current state |
+| `/jev topband show` / `/jev topband hide` | Shows or hides the band above the prompt (shown by default) |
+| `/jev statusband show` / `/jev statusband hide` | Shows or hides the status line under the prompt (hidden by default) |
+| `/jev help` | Lists these commands, the current state and the settings in use. A bare `/jev` does the same |
+
+The same words without the slash (`jev on`, `jev off` and so on) also work when typed as a prompt on their own, but the desktop app then shows "A hook blocked your prompt" beside the result. Use the slash form to avoid that.
 
 The band and the status line show the same text, for example `Jev: off`, `Jev: on (report only) · would pick sonnet` or `Jev: on (routing) · this turn runs on haiku`. Which of the two is shown is remembered across sessions. Routing itself always starts off in a new session.
 
@@ -59,7 +62,7 @@ Two options, set in the plugin's settings (`/config`, or `claude plugin configur
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `defaultMode` | `report` | The mode `jev on` starts: `report` or `apply` |
+| `defaultMode` | `report` | The mode `/jev on` starts: `report` or `apply` |
 | `models` | `haiku,sonnet,opus,fable` | The model for difficulty level 0, 1, 2 and 3, easiest first. Aliases or full model ids. With fewer than four, the last one covers the higher levels |
 
 ## How it decides

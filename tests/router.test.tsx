@@ -183,13 +183,38 @@ test('each indicator hides and shows on its own, and the choice is kept', async 
   expect(seen.statuses.at(-1)).toBe('Jev: off')
 
   const hidden = await $.prompt.submit({ text: 'jev topband hide', ...TYPED })
-  expect(hidden.drop).toBe('Top band hidden. Type "jev topband show" to bring it back.')
+  expect(hidden.drop).toBe('Top band hidden. /jev topband show brings it back.')
   ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /Jev/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /engine/ })).toBeDefined()
   await ui.unmount()
 
   expect(seen.store).toEqual({ isBandShown: false, isStatusShown: true })
+})
+
+test('/jev runs the same commands, and help lists them', async ($, on) => {
+  world(on, { status: 200, text: jevAnswer(1) })
+  const run = async (args: string): Promise<string | undefined> => {
+    const ran = await $.command.run({
+      command: 'jev',
+      args,
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 80 },
+    })
+
+    return ran.text
+  }
+
+  expect(await run('apply')).toBe('Jev: on (routing)')
+  expect(await run('statusband  hide')).toBe('Status band hidden. /jev statusband show brings it back.')
+
+  const listed = (await run('help')) ?? ''
+  expect(listed).toContain('Now: Jev: on (routing)')
+  expect(listed).toContain('/jev statusband show|hide')
+  expect(listed).toContain('models by difficulty haiku, sonnet, opus, fable')
+  // A bare /jev and a word it does not know answer with the same list.
+  expect(await run('')).toBe(listed)
+  expect(await run('nonsense')).toBe(listed)
 })
 
 test('a session starts with the stored choice', async ($, on) => {

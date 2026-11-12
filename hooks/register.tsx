@@ -10,10 +10,18 @@ const TIMEOUT_MS = 5000
 const RECENT_TURNS = 6
 const TURN_CHARS = 600
 const PROMPT_CHARS = 4000
-const TOGGLE = /^jev\s+(on|off|report|apply|status|(?:topband|statusband)\s+(?:show|hide))$/i
+const TOGGLE = /^jev\s+(on|off|report|apply|status|help|(?:topband|statusband)\s+(?:show|hide))$/i
 const DISPLAY = /^(topband|statusband) (show|hide)$/
-const USAGE =
-  'Say: jev on, jev off, jev report, jev apply, jev status, jev topband show|hide or jev statusband show|hide.'
+const HELP = [
+  '/jev on - turn routing on for this session, in the default mode',
+  '/jev report - show the model Jev would pick for each prompt, and change nothing',
+  '/jev apply - run each turn on the model Jev picks',
+  '/jev off - turn routing off: nothing more is sent to TypeSafe',
+  '/jev status - show the current state',
+  '/jev topband show|hide - the band above the prompt, with the mode buttons',
+  '/jev statusband show|hide - the status line under the prompt',
+  '/jev help - this list',
+]
 
 // Prompts a person typed: the terminal, a phone or web client, a host app.
 const PERSON = new Set(['composer', 'bridge', 'sdk'])
@@ -75,7 +83,17 @@ async function setDisplay($: EngineInterface, isBand: boolean, isShown: boolean)
   const name = isBand ? 'Top band' : 'Status band'
   const word = isBand ? 'topband' : 'statusband'
 
-  return isShown ? `${name} shown.` : `${name} hidden. Type "jev ${word} show" to bring it back.`
+  return isShown ? `${name} shown.` : `${name} hidden. /jev ${word} show brings it back.`
+}
+
+async function help($: EngineInterface, startMode: JevMode, models: readonly string[]): Promise<string> {
+  const line = describe(await read($, mode), await read($, pick), await read($, problem))
+
+  return [
+    `Jev model routing. Now: ${line}`,
+    ...HELP,
+    `Settings: default mode ${startMode}; models by difficulty ${models.join(', ')}.`,
+  ].join('\n')
 }
 
 async function loadDisplay($: EngineInterface): Promise<void> {
@@ -91,7 +109,12 @@ async function loadDisplay($: EngineInterface): Promise<void> {
   }
 }
 
-async function switchTo($: EngineInterface, word: string, startMode: JevMode): Promise<string> {
+async function switchTo(
+  $: EngineInterface,
+  word: string,
+  startMode: JevMode,
+  models: readonly string[],
+): Promise<string> {
   const display = DISPLAY.exec(word)
 
   if (display !== null) {
@@ -101,8 +124,9 @@ async function switchTo($: EngineInterface, word: string, startMode: JevMode): P
   const wanted: JevMode | undefined =
     word === 'on' ? startMode : word === 'off' || word === 'report' || word === 'apply' ? word : undefined
 
+  // Anything it does not know, `help` included, answers with the list.
   if (wanted === undefined && word !== 'status') {
-    return USAGE
+    return help($, startMode, models)
   }
 
   if (wanted !== undefined) {
@@ -193,7 +217,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'jev',
       description: 'Turn Jev model routing on or off for this session',
-      argumentHint: '[on|off|report|apply|status|topband show|hide|statusband show|hide]',
+      argumentHint: '[on|off|report|apply|status|topband show|hide|statusband show|hide|help]',
     })
     await loadDisplay($)
     await show($)
@@ -201,8 +225,9 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A bare /jev answers with the list.
   on('command.run', { command: 'jev' }, async ($, e) => ({
-    text: await switchTo($, e.args.trim().toLowerCase().replace(/\s+/g, ' ') || 'status', startMode),
+    text: await switchTo($, e.args.trim().toLowerCase().replace(/\s+/g, ' ') || 'help', startMode, models),
   }))
 
   // The band above the prompt: the state, and a button for each other mode.
@@ -219,12 +244,12 @@ export const register: Register = (on, options) => {
       <Box gap={1}>
         <Text dimColor>{line}</Text>
         {now !== 'report' && (
-          <Button key="report" label="Report only" onPress={() => switchTo($, 'report', startMode)} />
+          <Button key="report" label="Report only" onPress={() => switchTo($, 'report', startMode, models)} />
         )}
         {now !== 'apply' && (
-          <Button key="apply" label="Apply" onPress={() => switchTo($, 'apply', startMode)} />
+          <Button key="apply" label="Apply" onPress={() => switchTo($, 'apply', startMode, models)} />
         )}
-        {now !== 'off' && <Button key="off" label="Off" onPress={() => switchTo($, 'off', startMode)} />}
+        {now !== 'off' && <Button key="off" label="Off" onPress={() => switchTo($, 'off', startMode, models)} />}
       </Box>
     )
   })
@@ -241,7 +266,7 @@ export const register: Register = (on, options) => {
     if (toggle !== null) {
       const word = (toggle[1] ?? '').toLowerCase().replace(/\s+/g, ' ')
 
-      return { drop: await switchTo($, word, startMode) }
+      return { drop: await switchTo($, word, startMode, models) }
     }
 
     const now = await read($, mode)
