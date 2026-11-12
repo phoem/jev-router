@@ -10,8 +10,10 @@ const TIMEOUT_MS = 5000
 const RECENT_TURNS = 6
 const TURN_CHARS = 600
 const PROMPT_CHARS = 4000
-const TOGGLE = /^jev (on|off|report|apply|status)$/i
-const USAGE = 'Say: jev on, jev off, jev report, jev apply or jev status.'
+const TOGGLE = /^jev\s+(on|off|report|apply|status|(?:topband|statusband)\s+(?:show|hide))$/i
+const DISPLAY = /^(topband|statusband) (show|hide)$/
+const USAGE =
+  'Say: jev on, jev off, jev report, jev apply, jev status, jev topband show|hide or jev statusband show|hide.'
 
 // Prompts a person typed: the terminal, a phone or web client, a host app.
 const PERSON = new Set(['composer', 'bridge', 'sdk'])
@@ -19,6 +21,11 @@ const PERSON = new Set(['composer', 'bridge', 'sdk'])
 const mode = atom({ plugin: 'jev-router', key: 'mode' } as const, 'off')
 const pick = atom({ plugin: 'jev-router', key: 'pick' } as const, null)
 const problem = atom({ plugin: 'jev-router', key: 'problem' } as const, null)
+
+// Which indicators draw: the band above the prompt, the status line under it.
+// Kept in the store too, so the choice outlasts the session.
+const bandShown = atom({ plugin: 'jev-router', key: 'isBandShown' } as const, true)
+const statusShown = atom({ plugin: 'jev-router', key: 'isStatusShown' } as const, false)
 
 // The pick waiting for its turn to start, and the turn it was bound to.
 let armed: { text: string; model: string } | null = null
@@ -50,12 +57,47 @@ function describe(now: JevMode, picked: JevPick | null, wrong: string | null): s
 
 async function show($: EngineInterface): Promise<string> {
   const line = describe(await read($, mode), await read($, pick), await read($, problem))
-  $.ui.status(line)
+  $.ui.status((await read($, statusShown)) ? line : undefined)
 
   return line
 }
 
+async function setDisplay($: EngineInterface, isBand: boolean, isShown: boolean): Promise<string> {
+  if (isBand) {
+    await update($, bandShown, () => isShown)
+    await $.store.set('isBandShown', isShown)
+  } else {
+    await update($, statusShown, () => isShown)
+    await $.store.set('isStatusShown', isShown)
+    await show($)
+  }
+
+  const name = isBand ? 'Top band' : 'Status band'
+  const word = isBand ? 'topband' : 'statusband'
+
+  return isShown ? `${name} shown.` : `${name} hidden. Type "jev ${word} show" to bring it back.`
+}
+
+async function loadDisplay($: EngineInterface): Promise<void> {
+  const savedBand = await $.store.get('isBandShown')
+  const savedStatus = await $.store.get('isStatusShown')
+
+  if (typeof savedBand === 'boolean') {
+    await update($, bandShown, () => savedBand)
+  }
+
+  if (typeof savedStatus === 'boolean') {
+    await update($, statusShown, () => savedStatus)
+  }
+}
+
 async function switchTo($: EngineInterface, word: string, startMode: JevMode): Promise<string> {
+  const display = DISPLAY.exec(word)
+
+  if (display !== null) {
+    return setDisplay($, display[1] === 'topband', display[2] === 'show')
+  }
+
   const wanted: JevMode | undefined =
     word === 'on' ? startMode : word === 'off' || word === 'report' || word === 'apply' ? word : undefined
 
@@ -151,16 +193,41 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'jev',
       description: 'Turn Jev model routing on or off for this session',
-      argumentHint: '[on|off|report|apply|status]',
+      argumentHint: '[on|off|report|apply|status|topband show|hide|statusband show|hide]',
     })
+    await loadDisplay($)
     await show($)
 
     return next(e)
   })
 
   on('command.run', { command: 'jev' }, async ($, e) => ({
-    text: await switchTo($, e.args.trim().toLowerCase() || 'status', startMode),
+    text: await switchTo($, e.args.trim().toLowerCase().replace(/\s+/g, ' ') || 'status', startMode),
   }))
+
+  // The band above the prompt: the state, and a button for each other mode.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || !(await read($, bandShown))) {
+      return next(e)
+    }
+
+    const now = await read($, mode)
+    const line = describe(now, await read($, pick), await read($, problem))
+    const { Box, Button, Text } = $.ui.resolve(e)
+
+    return (
+      <Box gap={1}>
+        <Text dimColor>{line}</Text>
+        {now !== 'report' && (
+          <Button key="report" label="Report only" onPress={() => switchTo($, 'report', startMode)} />
+        )}
+        {now !== 'apply' && (
+          <Button key="apply" label="Apply" onPress={() => switchTo($, 'apply', startMode)} />
+        )}
+        {now !== 'off' && <Button key="off" label="Off" onPress={() => switchTo($, 'off', startMode)} />}
+      </Box>
+    )
+  })
 
   on('prompt.submit', async ($, e, next) => {
     const isTyped = PERSON.has(e.origin.kind) && e.isMeta !== true && e.command === undefined
@@ -172,7 +239,9 @@ export const register: Register = (on, options) => {
     const toggle = TOGGLE.exec(e.text.trim())
 
     if (toggle !== null) {
-      return { drop: await switchTo($, (toggle[1] ?? '').toLowerCase(), startMode) }
+      const word = (toggle[1] ?? '').toLowerCase().replace(/\s+/g, ' ')
+
+      return { drop: await switchTo($, word, startMode) }
     }
 
     const now = await read($, mode)

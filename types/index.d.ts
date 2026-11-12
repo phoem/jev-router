@@ -8,6 +8,8 @@ declare module 'claude-code' {
       mode: JevMode
       pick: JevPick | null
       problem: string | null
+      isBandShown: boolean
+      isStatusShown: boolean
     }
   }
 }

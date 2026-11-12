@@ -37,7 +37,9 @@ To try it without installing, start a session with `claude --plugin-dir "<path t
 
 ## Use
 
-Type one of these as a prompt on its own. The mod answers it and nothing is sent to the model. `/jev on` and the other forms work too where slash commands are available.
+The band above the prompt shows the state with a button for each other mode: **Report only**, **Apply** and **Off**. Click one to switch.
+
+You can also type one of these as a prompt on its own. The mod answers it and nothing is sent to the model; the desktop app labels such a prompt "A hook blocked your prompt", which is expected. `/jev on` and the other forms work too where slash commands are available.
 
 | Prompt | What it does |
 | --- | --- |
@@ -46,8 +48,10 @@ Type one of these as a prompt on its own. The mod answers it and nothing is sent
 | `jev apply` | Runs each turn on the picked model |
 | `jev off` | Turns it off: nothing more is sent to TypeSafe |
 | `jev status` | Shows the current state |
+| `jev topband show` / `jev topband hide` | Shows or hides the band above the prompt (shown by default) |
+| `jev statusband show` / `jev statusband hide` | Shows or hides the status line under the prompt (hidden by default) |
 
-The status line reads, for example, `Jev: off`, `Jev: on (report only) · would pick sonnet` or `Jev: on (routing) · this turn runs on haiku`. A new session always starts off.
+The band and the status line show the same text, for example `Jev: off`, `Jev: on (report only) · would pick sonnet` or `Jev: on (routing) · this turn runs on haiku`. Which of the two is shown is remembered across sessions. Routing itself always starts off in a new session.
 
 ## Settings
 

@@ -5,6 +5,20 @@ import { decide, parseAnswers, parseModels } from '../hooks/policy'
 
 const MODELS = ['haiku', 'sonnet', 'opus', 'fable']
 const TYPED = { wait: false, origin: { kind: 'composer' } } as const
+const SESSION = { cwd: '/', surface: 'desktop', isInteractive: true } as const
+const BAND = {
+  plugin: 'jev-router',
+  component: 'AbovePrompt',
+  props: {
+    hasSurvey: false,
+    isCollapsed: false,
+    isWorking: false,
+    maxRows: 10,
+    bodyColumns: 80,
+    scroll: { offset: 0, bodyRows: 9 },
+    view: {},
+  },
+} as const
 
 const jevAnswer = (depth: number, stakes = 0, followUp = 0): string =>
   JSON.stringify({
@@ -18,14 +32,25 @@ const jevAnswer = (depth: number, stakes = 0, followUp = 0): string =>
   })
 
 // Each hook here stands for the engine: nothing else sits beneath the mod.
-const world = (on: On, reply: { status: number; text: string }) => {
+const world = (
+  on: On,
+  reply: { status: number; text: string },
+  stored: Readonly<Record<string, unknown>> = { isStatusShown: true },
+) => {
   const seen = {
     statuses: [] as (string | undefined)[],
     requests: [] as { url: string; authorization?: string; body: string }[],
     stepModels: [] as string[],
     clock: mock.clock(on),
+    store: { ...stored } as Record<string, unknown>,
   }
   mock.env(on, { TYPESAFE_API_KEY: 'test-key' })
+  on('store.get', (_, e) => ({ value: seen.store[e.key] }))
+  on('store.set', (_, e) => {
+    seen.store[e.key] = e.value
+
+    return { value: undefined }
+  })
   on('session.messages', () => ({ value: [] }))
   on('ui.status', (_, e) => {
     seen.statuses.push(e.text)
@@ -49,6 +74,14 @@ const world = (on: On, reply: { status: number; text: string }) => {
     }
   })
   on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  // What the engine draws in the band when the mod draws nothing.
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+
+    return <Text>engine</Text>
+  })
+  on('command.register', () => ({ value: { command: 'jev' } }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* (_, e) {
     seen.stepModels.push(e.model)
@@ -76,6 +109,7 @@ test('off by default: the prompt goes through and nothing is sent to TypeSafe', 
 
 test('jev on is answered by the mod, and report mode shows the pick without routing', async ($, on) => {
   const seen = world(on, { status: 200, text: jevAnswer(1) })
+  await $.session.start(SESSION)
 
   const toggled = await $.prompt.submit({ text: 'jev on', ...TYPED })
   expect(toggled.drop).toBe('Jev: on (report only)')
@@ -95,6 +129,7 @@ test('jev on is answered by the mod, and report mode shows the pick without rout
 
 test('apply mode runs the main loop of that turn on the picked model', async ($, on) => {
   const seen = world(on, { status: 200, text: jevAnswer(0) })
+  await $.session.start(SESSION)
 
   await $.prompt.submit({ text: 'jev apply', ...TYPED })
   await $.prompt.submit({ text: 'rename this variable', ...TYPED })
@@ -109,6 +144,7 @@ test('apply mode runs the main loop of that turn on the picked model', async ($,
 
 test('a failed lookup says so and leaves the turn on the session model', async ($, on) => {
   const seen = world(on, { status: 401, text: '{"detail":"bad key"}' })
+  await $.session.start(SESSION)
 
   await $.prompt.submit({ text: 'jev apply', ...TYPED })
   const entered = await $.prompt.submit({ text: 'rename this variable', ...TYPED })
@@ -130,6 +166,59 @@ test('jev off stops the lookups', async ($, on) => {
 
   expect(toggled.drop).toBe('Jev: off')
   expect(seen.requests).toEqual([])
+})
+
+test('each indicator hides and shows on its own, and the choice is kept', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) }, {})
+  await $.session.start(SESSION)
+
+  // With nothing stored: the band draws, the status line does not.
+  expect(seen.statuses.at(-1)).toBeUndefined()
+  let ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Jev/ })).toBeDefined()
+  await ui.unmount()
+
+  const shown = await $.prompt.submit({ text: 'jev statusband show', ...TYPED })
+  expect(shown.drop).toBe('Status band shown.')
+  expect(seen.statuses.at(-1)).toBe('Jev: off')
+
+  const hidden = await $.prompt.submit({ text: 'jev topband hide', ...TYPED })
+  expect(hidden.drop).toBe('Top band hidden. Type "jev topband show" to bring it back.')
+  ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Jev/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /engine/ })).toBeDefined()
+  await ui.unmount()
+
+  expect(seen.store).toEqual({ isBandShown: false, isStatusShown: true })
+})
+
+test('a session starts with the stored choice', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) }, { isBandShown: false, isStatusShown: true })
+  await $.session.start(SESSION)
+
+  expect(seen.statuses.at(-1)).toBe('Jev: off')
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Jev/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the band shows the state, and its buttons switch the mode', async ($, on) => {
+  world(on, { status: 200, text: jevAnswer(1) })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+
+    expect((await ui.find({ type: 'Text', text: /Jev/ }))?.text).toBe('Jev: off')
+    expect(await ui.find({ key: 'off' })).toBeUndefined()
+
+    await ui.press({ key: 'apply' })
+    expect((await ui.find({ type: 'Text', text: /Jev/ }))?.text).toBe('Jev: on (routing)')
+    expect(await ui.find({ key: 'apply' })).toBeUndefined()
+
+    await ui.press({ key: 'off' })
+    expect((await ui.find({ type: 'Text', text: /Jev/ }))?.text).toBe('Jev: off')
+    await ui.unmount()
+  }
 })
 
 test('the policy maps the judgments to a level and a model', () => {
