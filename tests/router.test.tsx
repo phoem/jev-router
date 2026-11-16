@@ -37,6 +37,17 @@ const jevAnswer = (depth: number, stakes = 0, followUp = 0, inputTokens = 545): 
     usage: { input_tokens: inputTokens, output_tokens: 71 },
   })
 
+// What a Claude request reports of its tokens.
+const usage = (input: number, output: number, cached = 0) => ({
+  model: 'claude-test',
+  input_tokens: input,
+  output_tokens: output,
+  cache_read_input_tokens: cached,
+  cache_creation_input_tokens: 0,
+})
+
+const LOG = '/cfg/jev-router/lookups.jsonl'
+
 const command = async ($: Engine, args: string): Promise<string | undefined> => {
   const ran = await $.command.run({
     command: 'jev',
@@ -60,8 +71,25 @@ const world = (
     stepModels: [] as string[],
     clock: mock.clock(on),
     store: { ...stored } as Record<string, unknown>,
+    files: {} as Record<string, string>,
+    isWriteBlocked: false,
+    stepUsage: null as ReturnType<typeof usage> | null,
   }
-  mock.env(on, { TYPESAFE_API_KEY: 'test-key' })
+  mock.env(on, { TYPESAFE_API_KEY: 'test-key', CLAUDE_CONFIG_DIR: '/cfg' })
+  on('session.id', () => ({ value: 'test-session' }))
+  // The host may spell a path its own way (C:\cfg\...), so files go by one spelling.
+  const placed = (path: string): string => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
+  on('fs.exists', (_, e) => ({ value: placed(e.path) in seen.files }))
+  on('fs.read', (_, e) => ({ value: seen.files[placed(e.path)] ?? '' }))
+  on('fs.write', (_, e) => {
+    if (seen.isWriteBlocked) {
+      return { deny: 'the folder is read-only' }
+    }
+
+    seen.files[placed(e.path)] = e.text
+
+    return { value: undefined }
+  })
   on('store.get', (_, e) => ({ value: seen.store[e.key] }))
   on('store.set', (_, e) => {
     seen.store[e.key] = e.value
@@ -103,7 +131,7 @@ const world = (
   on('turn.step', async function* (_, e) {
     seen.stepModels.push(e.model)
 
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: seen.stepUsage }
   })
 
   return seen
@@ -310,6 +338,7 @@ test('a TypeSafe figure and the debug values join the status band, and are kept'
     usageShown: 'hide',
     isDebugShown: false,
     spendTotal: { requests: 2, inputTokens: 10_000_000, outputTokens: 142, rateLimited: 0 },
+    routingTotal: { sonnet: { picked: 2, applied: 0, steps: 0, inputTokens: 0, outputTokens: 0 } },
   })
 
   // With the status band hidden, the answer says where the figure would show.
@@ -343,7 +372,7 @@ test('the debug values and the usage figure show on the top band by default, and
 
   // Moved to the status line, they follow the routing text and leave the band.
   expect(await command($, 'details status')).toBe(
-    'The debug values and the TypeSafe usage figure now show on the status band.',
+    'The debug values, usage figure and stats now show on the status band.',
   )
   expect(seen.statuses.at(-1)).toBe(`Jev: on (report) → sonnet | ${debugRow} | ${usageRow}`)
   const offBand = await $.ui.mount({ ...BAND, surface: 'desktop' })
@@ -358,6 +387,245 @@ test('the debug values and the usage figure show on the top band by default, and
   await command($, 'topband hide')
   expect(await command($, 'debug show')).toBe(
     'Debug values shown on the top band after each lookup. The top band is hidden: /jev topband show shows it.',
+  )
+})
+
+test('the lookup log is off by default and writes nothing until it is turned on', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) })
+  await $.session.start(SESSION)
+
+  expect(await command($, 'debuglog')).toBe(
+    `Lookup log: off. 0 lookups are in ${LOG}.\n/jev debuglog on|off|clear, and /jev log [n] to read it.`,
+  )
+  await command($, 'on')
+  await $.prompt.submit({ text: 'add a retry to the upload call', ...TYPED })
+  await seen.clock.settle()
+
+  expect(seen.requests.length).toBe(1)
+  expect(seen.files).toEqual({})
+})
+
+test('/jev debuglog on adds one line per lookup, /jev log reads them, and off and clear stop and empty it', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1, 0.28, 0.02) })
+  await $.session.start(SESSION)
+
+  const turnedOn = (await command($, 'debuglog on')) ?? ''
+  expect(turnedOn).toContain("Lookup log on. Each lookup (your prompt text, Jev's answers")
+  expect(turnedOn).toContain(`is added to ${LOG}.`)
+  expect(seen.files[LOG]).toBe('')
+
+  await command($, 'on')
+  await $.prompt.submit({ text: 'add a retry to the upload call', ...TYPED })
+  await $.prompt.submit({ text: 'and log each attempt', ...TYPED })
+  await seen.clock.settle()
+
+  const entries = (seen.files[LOG] ?? '')
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  expect(entries.length).toBe(2)
+  expect(entries[0]).toEqual({
+    t: '1970-01-01T00:00:00.000Z',
+    session: 'test-session',
+    mode: 'report',
+    prompt: 'add a retry to the upload call',
+    recentTurns: 0,
+    ms: 0,
+    status: 200,
+    depth: 1,
+    confidence: 0.84,
+    probabilities: [0, 0.91, 0.09, 0],
+    stakes: 0.28,
+    followUp: 0.02,
+    level: 1,
+    model: 'sonnet',
+    inputTokens: 545,
+    outputTokens: 71,
+  })
+
+  // The band says the log is on.
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /Jev/ }))?.text).toBe('Jev: on (report) → sonnet · logging')
+  await ui.unmount()
+
+  const line = (prompt: string) =>
+    `1970-01-01 00:00:00Z report → sonnet (level 1) · depth 1.00, confidence 0.84 · stakes 0.28 · follow-up 0.02 · 545 in/71 out · 0ms · "${prompt}"`
+  expect(await command($, 'log')).toBe(
+    [`The last 2 of 2 logged lookups, from ${LOG}:`, line('add a retry to the upload call'), line('and log each attempt')].join('\n'),
+  )
+  expect(await command($, 'log 1')).toBe(
+    [`The last 1 of 2 logged lookups, from ${LOG}:`, line('and log each attempt')].join('\n'),
+  )
+
+  expect(await command($, 'debuglog off')).toBe(
+    `Lookup log off. What was logged stays in ${LOG}; /jev debuglog clear empties it.`,
+  )
+  await $.prompt.submit({ text: 'one more thing', ...TYPED })
+  await seen.clock.settle()
+  expect((seen.files[LOG] ?? '').trim().split('\n').length).toBe(2)
+
+  expect(await command($, 'debuglog clear')).toBe(`Lookup log cleared: ${LOG}`)
+  expect(seen.files[LOG]).toBe('')
+  expect(await command($, 'log')).toBe(
+    `No lookups are logged yet in ${LOG}. /jev debuglog on starts the log.`,
+  )
+})
+
+test('the log drops its oldest lines past the size cap, and keeps whole lines', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) })
+  await $.session.start(SESSION)
+  const old = JSON.stringify({ t: '1970-01-01T00:00:00.000Z', prompt: 'x'.repeat(980), mode: 'report', ms: 1 })
+  seen.files[LOG] = `${old}\n`.repeat(900)
+  await command($, 'debuglog on')
+  await command($, 'on')
+
+  await $.prompt.submit({ text: 'the newest prompt', ...TYPED })
+  await seen.clock.settle()
+
+  const text = seen.files[LOG] ?? ''
+  const lines = text.trim().split('\n')
+  expect(text.length).toBeLessThan(800_000)
+  expect(text.length).toBeGreaterThan(400_000)
+  expect(text.endsWith('\n')).toBe(true)
+  // Every line is a whole entry, and the new one is last.
+  expect(lines.every(line => (JSON.parse(line) as { prompt?: string }).prompt !== undefined)).toBe(true)
+  expect((JSON.parse(lines.at(-1) ?? '{}') as { prompt?: string }).prompt).toBe('the newest prompt')
+})
+
+test('a lookup that fails is logged with its error and has no pick', async ($, on) => {
+  const seen = world(on, { status: 429, text: '{"detail":"slow down"}' })
+  await $.session.start(SESSION)
+  await command($, 'debuglog on')
+  await command($, 'apply')
+
+  await $.prompt.submit({ text: 'rename this variable', ...TYPED })
+  await seen.clock.settle()
+
+  const entry = JSON.parse((seen.files[LOG] ?? '').trim()) as Record<string, unknown>
+  expect(entry.status).toBe(429)
+  expect(entry.error).toBe('TypeSafe answered 429')
+  expect(entry.model).toBeUndefined()
+  expect(await command($, 'log')).toContain(
+    '1970-01-01 00:00:00Z apply · no pick: TypeSafe answered 429 · 0ms · "rename this variable"',
+  )
+  // A failed lookup picks nothing, so nothing is counted for a model.
+  expect(seen.store.routingTotal).toBeUndefined()
+})
+
+test('the log says when it cannot be written, and stays off', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) })
+  await $.session.start(SESSION)
+
+  seen.isWriteBlocked = true
+  expect(await command($, 'debuglog on')).toContain(
+    `The lookup log was not changed: ${LOG} cannot be written (`,
+  )
+  expect(await command($, 'debuglog')).toContain('Lookup log: off.')
+
+  // A write that fails later is kept, and shown in the band.
+  seen.isWriteBlocked = false
+  await command($, 'debuglog on')
+  seen.isWriteBlocked = true
+  await command($, 'on')
+  await $.prompt.submit({ text: 'add a retry to the upload call', ...TYPED })
+  await seen.clock.settle()
+
+  expect(await command($, 'debuglog')).toContain('The last write failed: ')
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /Jev/ }))?.text).toBe('Jev: on (report) → sonnet · log error')
+  await ui.unmount()
+})
+
+test('/jev stats counts what each lookup picked and the tokens the routed turns used', async ($, on) => {
+  const reply = { status: 200, text: jevAnswer(0) }
+  const seen = world(on, reply)
+  await $.session.start(SESSION)
+  await command($, 'apply')
+
+  // A lookup that picks haiku, and a turn of two requests on it (the cache counts as input).
+  await $.prompt.submit({ text: 'rename this variable', ...TYPED })
+  await $.turn.start({ text: 'rename this variable', turnId: 't1' })
+  seen.stepUsage = usage(100, 20, 900)
+  await drain($.turn.step({ turnId: 't1', index: 0, model: 'opus', messageCount: 1 }))
+  await drain($.turn.step({ turnId: 't1', index: 1, model: 'opus', messageCount: 3 }))
+  // A subagent's request is not routed, so it is not counted.
+  await drain($.turn.step({ turnId: 't1', index: 2, model: 'opus', messageCount: 3, agentId: 'a1' }))
+
+  // A lookup that picks opus, and one request on it.
+  reply.text = jevAnswer(2)
+  await $.prompt.submit({ text: 'find why the cache misses', ...TYPED })
+  await $.turn.start({ text: 'find why the cache misses', turnId: 't2' })
+  seen.stepUsage = usage(50, 10)
+  await drain($.turn.step({ turnId: 't2', index: 0, model: 'haiku', messageCount: 1 }))
+
+  // A lookup in report mode picks sonnet, but reroutes nothing.
+  reply.text = jevAnswer(1)
+  await command($, 'report')
+  await $.prompt.submit({ text: 'add a retry', ...TYPED })
+  await seen.clock.settle()
+
+  const lines = {
+    haiku: '  haiku: picked 1, applied 1 · 2 requests, 2000 input tokens, 40 output tokens',
+    sonnet: '  sonnet: picked 1, applied 0 · 0 requests, 0 input tokens, 0 output tokens',
+    opus: '  opus: picked 1, applied 1 · 1 requests, 50 input tokens, 10 output tokens',
+    fable: '  fable: picked 0, applied 0 · 0 requests, 0 input tokens, 0 output tokens',
+  }
+  const report = (await command($, 'stats')) ?? ''
+  const session = report.slice(report.indexOf('This session:'), report.indexOf('All sessions:'))
+  expect(session).toBe(`This session:\n${Object.values(lines).join('\n')}\n`)
+  expect(report.slice(report.indexOf('All sessions:'))).toContain(Object.values(lines).join('\n'))
+  expect(report.startsWith("Jev routing stats, counting this router's lookups only:\n")).toBe(true)
+
+  expect(seen.store.routingTotal).toEqual({
+    haiku: { picked: 1, applied: 1, steps: 2, inputTokens: 2000, outputTokens: 40 },
+    opus: { picked: 1, applied: 1, steps: 1, inputTokens: 50, outputTokens: 10 },
+    sonnet: { picked: 1, applied: 0, steps: 0, inputTokens: 0, outputTokens: 0 },
+  })
+})
+
+test('the stats show as rows on the band or after the routing text, and are kept', async ($, on) => {
+  const reply = { status: 200, text: jevAnswer(0) }
+  const seen = world(on, reply)
+  await $.session.start(SESSION)
+
+  expect(await command($, 'stats show')).toBe(
+    'Stats shown on the top band: what each model was picked for, and the tokens its turns used.',
+  )
+  await command($, 'apply')
+  await $.prompt.submit({ text: 'rename this variable', ...TYPED })
+  await $.turn.start({ text: 'rename this variable', turnId: 't1' })
+  seen.stepUsage = usage(100, 20, 1900)
+  await drain($.turn.step({ turnId: 't1', index: 0, model: 'opus', messageCount: 1 }))
+  await seen.clock.settle()
+
+  const onBand = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await onBand.find({ type: 'Text', text: /Picked/ }))?.text).toBe('Picked this session: haiku 1')
+  expect((await onBand.find({ type: 'Text', text: /Tokens in/ }))?.text).toBe(
+    'Tokens in/out by model, apply mode: haiku 2k/20',
+  )
+  await onBand.unmount()
+  expect(seen.statuses.at(-1)).toBe('Jev: on (apply) → haiku')
+
+  await command($, 'details status')
+  expect(seen.statuses.at(-1)).toBe(
+    'Jev: on (apply) → haiku | Picked this session: haiku 1 | Tokens in/out by model, apply mode: haiku 2k/20',
+  )
+
+  expect(await command($, 'stats hide')).toBe('Stats hidden.')
+  expect(seen.statuses.at(-1)).toBe('Jev: on (apply) → haiku')
+  expect(seen.store.isStatsShown).toBe(false)
+})
+
+test('a session starts with the stored stats', async ($, on) => {
+  const earlier = { haiku: { picked: 7, applied: 5, steps: 9, inputTokens: 123456, outputTokens: 7890 } }
+  world(on, { status: 200, text: jevAnswer(1) }, { isStatusShown: true, routingTotal: earlier })
+  await $.session.start(SESSION)
+
+  const report = (await command($, 'stats')) ?? ''
+  const all = report.slice(report.indexOf('All sessions:'))
+  expect(all).toContain('  haiku: picked 7, applied 5 · 9 requests, 123456 input tokens, 7890 output tokens')
+  expect(report.slice(0, report.indexOf('All sessions:'))).toContain(
+    '  haiku: picked 0, applied 0 · 0 requests, 0 input tokens, 0 output tokens',
   )
 })
 

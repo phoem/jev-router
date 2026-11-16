@@ -1,8 +1,31 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, TurnUsage } from 'claude-code'
 
-import type { JevChoice, JevDetail, JevDetailsAt, JevMode, JevSpend, JevUsageShown } from '../types'
-import { NO_SPEND, asSpend, debugPart, describe, usagePart, usageReport } from './display'
+import type {
+  JevChoice,
+  JevDetail,
+  JevDetailsAt,
+  JevLogEntry,
+  JevMode,
+  JevModelStat,
+  JevRouted,
+  JevSpend,
+  JevUsageShown,
+} from '../types'
+import {
+  NO_SPEND,
+  NO_STAT,
+  asRouted,
+  asSpend,
+  debugPart,
+  describe,
+  logLine,
+  parseLog,
+  statsReport,
+  statsRows,
+  usagePart,
+  usageReport,
+} from './display'
 import { buildRequest, decide, parseAnswers, parseModels, parseUsage } from './policy'
 import type { Judgments, Tokens, Turn } from './policy'
 
@@ -11,11 +34,20 @@ const TIMEOUT_MS = 5000
 const RECENT_TURNS = 6
 const TURN_CHARS = 600
 const PROMPT_CHARS = 4000
+// The log is one file rewritten whole for each entry, so it stays small: past the
+// cap the oldest lines go until about the keep size is left.
+const LOG_MAX_CHARS = 800_000
+const LOG_KEEP_CHARS = 500_000
+const LOG_SHOWN = 5
+const LOG_SHOWN_MAX = 20
 const TOGGLE =
-  /^jev\s+(on|off|report|apply|status|help|usage(?:\s+(?:money|tokens|limits|hide))?|details\s+(?:top|status)|(?:topband|statusband|debug)\s+(?:show|hide))$/i
+  /^jev\s+(on|off|report|apply|status|help|usage(?:\s+(?:money|tokens|limits|hide))?|details\s+(?:top|status)|stats(?:\s+(?:show|hide))?|debuglog(?:\s+(?:on|off|clear))?|log(?:\s+\d+)?|(?:topband|statusband|debug)\s+(?:show|hide))$/i
 const DISPLAY = /^(topband|statusband|debug) (show|hide)$/
 const USAGE = /^usage(?: (money|tokens|limits|hide))?$/
 const DETAILS = /^details (top|status)$/
+const STATS = /^stats(?: (show|hide))?$/
+const LOGSET = /^debuglog(?: (on|off|clear))?$/
+const LOGSHOW = /^log(?: (\d+))?$/
 const STATUS_HIDDEN = ' The status band is hidden: /jev statusband show shows it.'
 const TOP_HIDDEN = ' The top band is hidden: /jev topband show shows it.'
 const HELP = [
@@ -26,8 +58,13 @@ const HELP = [
   '/jev status - show the current state',
   "/jev usage - what the router's lookups have used at TypeSafe: requests, tokens, estimated cost",
   '/jev usage money|tokens|limits|hide - show one TypeSafe figure, or hide it',
+  '/jev stats - how many lookups picked each model, and the tokens its turns used',
+  '/jev stats show|hide - show those as rows on the band, or hide them',
   "/jev debug show|hide - show Jev's scores, confidence and probabilities, or hide them",
-  '/jev details top|status - where those two show: the top band (default, has room) or the status line (short)',
+  '/jev details top|status - where the debug values, usage and stats show: the top band (default, has room) or the status line (short)',
+  "/jev debuglog on|off - log every lookup (your prompt text, Jev's answers, the model picked) to a file; off by default",
+  '/jev debuglog clear - empty the log; /jev debuglog alone says where it is',
+  '/jev log [n] - show the last n logged lookups (5 by default)',
   '/jev topband show|hide - the band above the prompt, with the mode buttons',
   '/jev statusband show|hide - the status line under the prompt',
   '/jev help - this list',
@@ -39,18 +76,27 @@ const PERSON = new Set(['composer', 'bridge', 'sdk'])
 const mode = atom({ plugin: 'jev-router', key: 'mode' } as const, 'off')
 const pick = atom({ plugin: 'jev-router', key: 'pick' } as const, null)
 const problem = atom({ plugin: 'jev-router', key: 'problem' } as const, null)
-// What the router's lookups have used at TypeSafe: this session, and in all
-// sessions (kept in the store, read back at the start).
+// What the router's lookups have used at TypeSafe, and what routing came to for
+// each model: this session, and in all sessions (kept in the store, read back at
+// the start).
 const spend = atom({ plugin: 'jev-router', key: 'spend' } as const, NO_SPEND)
 const spendAll = atom({ plugin: 'jev-router', key: 'spendAll' } as const, NO_SPEND)
+const routed = atom({ plugin: 'jev-router', key: 'routed' } as const, {})
+const routedAll = atom({ plugin: 'jev-router', key: 'routedAll' } as const, {})
 
-// What draws, and what the status band adds to the routing line. Kept in the
-// store too, so the choices outlast the session.
+// What draws, and what the bands add to the routing line. Kept in the store too,
+// so the choices outlast the session.
 const bandShown = atom({ plugin: 'jev-router', key: 'isBandShown' } as const, true)
 const statusShown = atom({ plugin: 'jev-router', key: 'isStatusShown' } as const, false)
 const debugShown = atom({ plugin: 'jev-router', key: 'isDebugShown' } as const, false)
+const statsShown = atom({ plugin: 'jev-router', key: 'isStatsShown' } as const, false)
 const usageShown = atom({ plugin: 'jev-router', key: 'usageShown' } as const, 'hide')
 const detailsAt = atom({ plugin: 'jev-router', key: 'detailsAt' } as const, 'top')
+
+// The lookup log is on for this session only: it writes prompt text to disk, so
+// every new session starts with it off. `logProblem` is why the last write failed.
+const logOn = atom({ plugin: 'jev-router', key: 'isLogOn' } as const, false)
+const logProblem = atom({ plugin: 'jev-router', key: 'logProblem' } as const, null)
 
 // The mode picked on the band or by /jev report|apply; null until then, when
 // the defaultMode setting stands.
@@ -60,7 +106,10 @@ const chosen = atom({ plugin: 'jev-router', key: 'chosen' } as const, null)
 let armed: { text: string; model: string } | null = null
 let active: { turnId: string; model: string } | null = null
 
-// The debug values and the usage figure, whichever are on, one row each.
+// The `models` setting, for the order the stats list models in.
+let modelOrder: readonly string[] = []
+
+// The debug values, the usage figure and the stats, whichever are on, one row each.
 async function detailRows($: EngineInterface): Promise<string[]> {
   const picked = await read($, pick)
   const rows: string[] = []
@@ -72,6 +121,10 @@ async function detailRows($: EngineInterface): Promise<string[]> {
 
   if (usageKind !== 'hide') {
     rows.push(usagePart(usageKind, await read($, spend), await read($, spendAll)))
+  }
+
+  if (await read($, statsShown)) {
+    rows.push(...statsRows(await read($, routed), modelOrder))
   }
 
   return rows
@@ -143,7 +196,7 @@ async function setDetails($: EngineInterface, at: JevDetailsAt): Promise<string>
 
   const { note } = await whereDetails($)
 
-  return `The debug values and the TypeSafe usage figure now show on the ${at} band.${note}`
+  return `The debug values, usage figure and stats now show on the ${at} band.${note}`
 }
 
 async function setUsage($: EngineInterface, shown: JevUsageShown): Promise<string> {
@@ -160,16 +213,39 @@ async function setUsage($: EngineInterface, shown: JevUsageShown): Promise<strin
   return `TypeSafe usage on the ${at} band: ${shown}.${note}`
 }
 
+async function setStats($: EngineInterface, isShown: boolean): Promise<string> {
+  await update($, statsShown, () => isShown)
+  await $.store.set('isStatsShown', isShown)
+  await show($)
+
+  if (!isShown) {
+    return 'Stats hidden.'
+  }
+
+  const { at, note } = await whereDetails($)
+
+  return `Stats shown on the ${at} band: what each model was picked for, and the tokens its turns used.${note}`
+}
+
 async function reportUsage($: EngineInterface): Promise<string> {
   return usageReport(await read($, spend), await read($, spendAll))
 }
 
-// Counts one answered lookup, or one rate-limited request, for this session and
-// for all sessions. The total is re-read from the store each time, so sessions
-// open at once do not overwrite each other's counts, and the counts are made one
-// at a time, so lookups in flight together do not overwrite each other's.
-// Counting never fails a lookup.
-let counting: Promise<void> = Promise.resolve()
+async function reportStats($: EngineInterface): Promise<string> {
+  return statsReport(await read($, routed), await read($, routedAll), modelOrder)
+}
+
+// The counts below are made one at a time, whichever lookup or turn they come
+// from, so two in flight together do not overwrite each other's counts or the
+// log file's. A total is re-read from the store each time, so sessions open at
+// once do not overwrite each other's either. Counting never fails a lookup.
+let queue: Promise<void> = Promise.resolve()
+
+function enqueue(task: () => Promise<void>): Promise<void> {
+  queue = queue.then(task).catch(() => undefined)
+
+  return queue
+}
 
 async function count($: EngineInterface, tokens: Tokens | undefined, isRateLimited: boolean): Promise<void> {
   const add = (held: JevSpend): JevSpend => ({
@@ -190,9 +266,155 @@ async function count($: EngineInterface, tokens: Tokens | undefined, isRateLimit
 }
 
 function record($: EngineInterface, tokens: Tokens | undefined, isRateLimited: boolean): Promise<void> {
-  counting = counting.then(() => count($, tokens, isRateLimited))
+  return enqueue(() => count($, tokens, isRateLimited))
+}
 
-  return counting
+// Changes one model's routing stats, for this session and for all sessions.
+async function countRouted(
+  $: EngineInterface,
+  model: string,
+  add: (held: JevModelStat) => JevModelStat,
+): Promise<void> {
+  const change = (all: JevRouted): JevRouted => ({ ...all, [model]: add(all[model] ?? NO_STAT) })
+
+  try {
+    const total = change(asRouted(await $.store.get('routingTotal')) ?? {})
+    await $.store.set('routingTotal', total)
+    await update($, routed, change)
+    await update($, routedAll, () => total)
+  } catch {
+    // The stats are for display; routing goes on without them.
+  }
+}
+
+// A lookup picked this model; `isApplied` when it was made in apply mode.
+function recordPick($: EngineInterface, model: string, isApplied: boolean): Promise<void> {
+  return enqueue(() =>
+    countRouted($, model, held => ({
+      ...held,
+      picked: held.picked + 1,
+      applied: held.applied + (isApplied ? 1 : 0),
+    })),
+  )
+}
+
+// A Claude request ran on this routed model, with the tokens it used if reported.
+function recordStep($: EngineInterface, model: string, usage: TurnUsage | null): Promise<void> {
+  const input = usage === null ? 0 : usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+  const output = usage === null ? 0 : usage.output_tokens
+
+  return enqueue(() =>
+    countRouted($, model, held => ({
+      ...held,
+      steps: held.steps + 1,
+      inputTokens: held.inputTokens + input,
+      outputTokens: held.outputTokens + output,
+    })),
+  )
+}
+
+// Where the lookup log is: in the Claude config folder, not in a project, since
+// it holds prompt text. Undefined when no home folder can be found.
+async function logPath($: EngineInterface): Promise<string | undefined> {
+  const configured = await $.env.get('CLAUDE_CONFIG_DIR')
+  const profile = await $.env.get('USERPROFILE')
+  const home = await $.env.get('HOME')
+  const base = [profile, home].find(one => one !== undefined && one !== '')
+  const folder = configured !== undefined && configured !== '' ? configured : base === undefined ? undefined : `${base}/.claude`
+
+  return folder === undefined ? undefined : `${folder.replace(/[\\/]+$/, '')}/jev-router/lookups.jsonl`
+}
+
+async function readLog($: EngineInterface, path: string): Promise<string> {
+  return (await $.fs.exists(path)) ? $.fs.read(path) : ''
+}
+
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+// Adds one entry to the log; a failure is kept for /jev debuglog to say.
+async function appendLog($: EngineInterface, entry: JevLogEntry): Promise<void> {
+  try {
+    const path = await logPath($)
+
+    if (path === undefined) {
+      return
+    }
+
+    let text = `${await readLog($, path)}${JSON.stringify(entry)}\n`
+
+    if (text.length > LOG_MAX_CHARS) {
+      text = text.slice(text.indexOf('\n', text.length - LOG_KEEP_CHARS) + 1)
+    }
+
+    await $.fs.write(path, text)
+    await update($, logProblem, () => null)
+  } catch (error) {
+    const why = reasonOf(error)
+    await update($, logProblem, () => why)
+  }
+}
+
+function logEntry($: EngineInterface, entry: JevLogEntry): Promise<void> {
+  return enqueue(() => appendLog($, entry))
+}
+
+async function setLog($: EngineInterface, which: string | undefined): Promise<string> {
+  const path = await logPath($)
+
+  if (path === undefined) {
+    return 'The lookup log has nowhere to go: no home or Claude config folder was found.'
+  }
+
+  if (which === 'on' || which === 'clear') {
+    try {
+      await $.fs.write(path, which === 'clear' ? '' : await readLog($, path))
+    } catch (error) {
+      return `The lookup log was not changed: ${path} cannot be written (${reasonOf(error)}).`
+    }
+
+    if (which === 'clear') {
+      return `Lookup log cleared: ${path}`
+    }
+
+    await update($, logOn, () => true)
+    await update($, logProblem, () => null)
+
+    return `Lookup log on. Each lookup (your prompt text, Jev's answers, the model picked and the tokens) is added to ${path}. /jev log shows the latest, /jev debuglog off stops it, and it starts off again in every new session.`
+  }
+
+  if (which === 'off') {
+    await update($, logOn, () => false)
+
+    return `Lookup log off. What was logged stays in ${path}; /jev debuglog clear empties it.`
+  }
+
+  const entries = parseLog(await readLog($, path).catch(() => ''))
+  const wrong = await read($, logProblem)
+
+  return [
+    `Lookup log: ${(await read($, logOn)) ? 'on' : 'off'}. ${entries.length} lookups are in ${path}.`,
+    ...(wrong === null ? [] : [`The last write failed: ${wrong}`]),
+    '/jev debuglog on|off|clear, and /jev log [n] to read it.',
+  ].join('\n')
+}
+
+async function showLog($: EngineInterface, wanted: number): Promise<string> {
+  const path = await logPath($)
+
+  if (path === undefined || !(await $.fs.exists(path))) {
+    return 'No lookups are logged yet. /jev debuglog on starts the log.'
+  }
+
+  const all = parseLog(await $.fs.read(path))
+  const shown = all.slice(-Math.min(Math.max(wanted, 1), LOG_SHOWN_MAX))
+
+  if (shown.length === 0) {
+    return `No lookups are logged yet in ${path}. /jev debuglog on starts the log.`
+  }
+
+  return [`The last ${shown.length} of ${all.length} logged lookups, from ${path}:`, ...shown.map(logLine)].join('\n')
 }
 
 async function help($: EngineInterface, startMode: JevMode, models: readonly string[]): Promise<string> {
@@ -209,12 +431,18 @@ async function loadDisplay($: EngineInterface): Promise<void> {
   const savedBand = await $.store.get('isBandShown')
   const savedStatus = await $.store.get('isStatusShown')
   const savedDebug = await $.store.get('isDebugShown')
+  const savedStats = await $.store.get('isStatsShown')
   const savedUsage = await $.store.get('usageShown')
   const savedAt = await $.store.get('detailsAt')
   const savedSpend = asSpend(await $.store.get('spendTotal'))
+  const savedRouted = asRouted(await $.store.get('routingTotal'))
 
   if (savedSpend !== undefined) {
     await update($, spendAll, () => savedSpend)
+  }
+
+  if (savedRouted !== undefined) {
+    await update($, routedAll, () => savedRouted)
   }
 
   if (typeof savedBand === 'boolean') {
@@ -227,6 +455,10 @@ async function loadDisplay($: EngineInterface): Promise<void> {
 
   if (typeof savedDebug === 'boolean') {
     await update($, debugShown, () => savedDebug)
+  }
+
+  if (typeof savedStats === 'boolean') {
+    await update($, statsShown, () => savedStats)
   }
 
   if (savedAt === 'top' || savedAt === 'status') {
@@ -264,6 +496,24 @@ async function switchTo(
     return shown === 'money' || shown === 'tokens' || shown === 'limits' || shown === 'hide'
       ? setUsage($, shown)
       : reportUsage($)
+  }
+
+  const stats = STATS.exec(word)
+
+  if (stats !== null) {
+    return stats[1] === undefined ? reportStats($) : setStats($, stats[1] === 'show')
+  }
+
+  const logSet = LOGSET.exec(word)
+
+  if (logSet !== null) {
+    return setLog($, logSet[1])
+  }
+
+  const logShow = LOGSHOW.exec(word)
+
+  if (logShow !== null) {
+    return showLog($, logShow[1] === undefined ? LOG_SHOWN : Number(logShow[1]))
   }
 
   if (word === 'report' || word === 'apply') {
@@ -317,11 +567,23 @@ async function flipPower($: EngineInterface, startMode: JevMode): Promise<void> 
   await show($)
 }
 
-async function judge($: EngineInterface, text: string): Promise<Judgments | string> {
+// What one request to TypeSafe came to: its answers or why it has none, the
+// HTTP status, the tokens it was billed for, how long it took, and how many
+// recent messages went along with the prompt.
+type Lookup = {
+  judged?: Judgments
+  problem?: string
+  status?: number
+  tokens?: Tokens
+  ms: number
+  recent: number
+}
+
+async function judge($: EngineInterface, text: string): Promise<Lookup> {
   const key = await $.env.get('TYPESAFE_API_KEY')
 
   if (key === undefined || key === '') {
-    return 'TYPESAFE_API_KEY is not set'
+    return { problem: 'TYPESAFE_API_KEY is not set', ms: 0, recent: 0 }
   }
 
   const recent: Turn[] = (await $.session.messages())
@@ -334,6 +596,7 @@ async function judge($: EngineInterface, text: string): Promise<Judgments | stri
   const timedOut = new Promise<undefined>(resolve => {
     giveUp = () => resolve(undefined)
   })
+  const started = await $.clock.now()
   const timer = $.clock.after(TIMEOUT_MS, () => giveUp())
   const response = await Promise.race([
     $.http.fetch(ENDPOINT, {
@@ -344,22 +607,29 @@ async function judge($: EngineInterface, text: string): Promise<Judgments | stri
     timedOut,
   ])
   timer.cancel()
+  const ms = (await $.clock.now()) - started
 
   if (response === undefined) {
-    return 'TypeSafe timed out'
+    return { problem: 'TypeSafe timed out', ms, recent: recent.length }
   }
 
-  if (response.status === 429) {
+  const { status } = response
+
+  if (status === 429) {
     await record($, undefined, true)
   }
 
   if (!response.ok) {
-    return `TypeSafe answered ${response.status}`
+    return { problem: `TypeSafe answered ${status}`, status, ms, recent: recent.length }
   }
 
-  await record($, parseUsage(response.text), false)
+  const tokens = parseUsage(response.text)
+  await record($, tokens, false)
+  const judged = parseAnswers(response.text)
 
-  return parseAnswers(response.text) ?? 'TypeSafe sent an answer the router could not read'
+  return judged === undefined
+    ? { problem: 'TypeSafe sent an answer the router could not read', status, tokens, ms, recent: recent.length }
+    : { judged, status, tokens, ms, recent: recent.length }
 }
 
 async function route(
@@ -368,40 +638,67 @@ async function route(
   now: JevMode,
   models: readonly string[],
 ): Promise<void> {
-  let judged: Judgments | string
+  let lookup: Lookup
 
   try {
-    judged = await judge($, text)
+    lookup = await judge($, text)
   } catch {
-    judged = 'TypeSafe could not be reached'
+    lookup = { problem: 'TypeSafe could not be reached', ms: 0, recent: 0 }
   }
 
-  if (typeof judged === 'string') {
-    const wrong = judged
+  const { judged } = lookup
+  const decision = judged === undefined ? undefined : decide(judged, models, (await read($, pick))?.level)
+
+  if (judged === undefined || decision === undefined) {
+    const wrong = lookup.problem ?? 'no answer'
     armed = null
     await update($, pick, () => null)
     await update($, problem, () => wrong)
   } else {
-    const previous = await read($, pick)
-    const chosen = decide(judged, models, previous?.level)
     const detail: JevDetail = judged
-    armed = now === 'apply' ? { text: text.trim(), model: chosen.model } : null
-    await update($, pick, () => ({ ...chosen, detail }))
+    armed = now === 'apply' ? { text: text.trim(), model: decision.model } : null
+    await update($, pick, () => ({ ...decision, detail }))
     await update($, problem, () => null)
+    await recordPick($, decision.model, now === 'apply')
   }
 
   await show($)
+
+  // The log is added to after the pick is shown, and not waited for, so it never
+  // holds a turn back.
+  if (await read($, logOn)) {
+    void logEntry($, {
+      t: new Date(await $.clock.now()).toISOString(),
+      session: await $.session.id(),
+      mode: now === 'apply' ? 'apply' : 'report',
+      prompt: text.slice(0, PROMPT_CHARS),
+      recentTurns: lookup.recent,
+      ms: lookup.ms,
+      status: lookup.status,
+      error: lookup.problem,
+      depth: judged?.depth,
+      confidence: judged?.confidence,
+      probabilities: judged?.probabilities,
+      stakes: judged?.stakes,
+      followUp: judged?.followUp,
+      level: decision?.level,
+      model: decision?.model,
+      inputTokens: lookup.tokens?.input,
+      outputTokens: lookup.tokens?.output,
+    })
+  }
 }
 
 export const register: Register = (on, options) => {
   const startMode: JevMode = options.defaultMode === 'apply' ? 'apply' : 'report'
   const models = parseModels(typeof options.models === 'string' ? options.models : '')
+  modelOrder = models
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'jev',
       description: 'Turn Jev model routing on or off for this session',
-      argumentHint: '[on|off|report|apply|status|usage|debug|details|topband|statusband|help]',
+      argumentHint: '[on|off|report|apply|status|usage|stats|debug|debuglog|log|details|topband|statusband|help]',
     })
     await loadDisplay($)
     await show($)
@@ -424,16 +721,19 @@ export const register: Register = (on, options) => {
 
     const now = await read($, mode)
     const choice = (await read($, chosen)) ?? startMode
+    const isLogging = await read($, logOn)
+    const logFailure = await read($, logProblem)
     const line = describe(now, await read($, pick), await read($, problem))
     const rows = (await read($, detailsAt)) === 'top' ? await detailRows($) : []
     const { Box, Button, Text } = $.ui.resolve(e)
+    const logging = !isLogging ? '' : logFailure === null ? ' · logging' : ' · log error'
 
     return (
       <Box flexDirection="column">
         <Box gap={1}>
           <Box flexGrow={1} flexShrink={1}>
             <Text dimColor wrap="truncate-end">
-              {line}
+              {`${line}${logging}`}
             </Text>
           </Box>
           <Box gap={1} flexShrink={0}>
@@ -499,14 +799,18 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // Subagents keep their own models: only the main loop's requests are routed.
+  // Subagents keep their own models: only the main loop's requests are routed,
+  // and each one counts toward the model it ran on.
   on('turn.step', async function* ($, e, next) {
-    const routed = active
+    const bound = active
 
-    if (e.agentId !== undefined || routed === null || routed.turnId !== e.turnId) {
+    if (e.agentId !== undefined || bound === null || bound.turnId !== e.turnId) {
       return yield* next(e)
     }
 
-    return yield* next({ ...e, model: routed.model })
+    const result = yield* next({ ...e, model: bound.model })
+    await recordStep($, bound.model, result.usage)
+
+    return result
   })
 }
