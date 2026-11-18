@@ -9,6 +9,7 @@ import type {
   JevMode,
   JevModelStat,
   JevRouted,
+  JevSessionRecord,
   JevSpend,
   JevUsageShown,
 } from '../types'
@@ -16,11 +17,13 @@ import {
   NO_SPEND,
   NO_STAT,
   asRouted,
+  asSessions,
   asSpend,
   debugPart,
   describe,
   logLine,
   parseLog,
+  pruneSessions,
   statsReport,
   statsRows,
   usagePart,
@@ -39,6 +42,8 @@ const PROMPT_CHARS = 4000
 const LOG_MAX_CHARS = 800_000
 const LOG_KEEP_CHARS = 500_000
 const LOG_SHOWN = 5
+// How many chats' modes and stats are kept for reopening them.
+const SESSIONS_KEPT = 50
 const LOG_SHOWN_MAX = 20
 const TOGGLE =
   /^jev\s+(on|off|report|apply|status|help|usage(?:\s+(?:money|tokens|limits|hide))?|details\s+(?:top|status)|stats(?:\s+(?:show|hide))?|debuglog(?:\s+(?:on|off|clear))?|log(?:\s+\d+)?|(?:topband|statusband|debug)\s+(?:show|hide))$/i
@@ -55,7 +60,7 @@ const HELP = [
   '/jev report - show the model Jev would pick for each prompt, and change nothing',
   '/jev apply - run each turn on the model Jev picks',
   '/jev off - turn routing off: nothing more is sent to TypeSafe',
-  '/jev status - show the current state',
+  '/jev status - show the current state. A chat keeps its mode and its stats, and picks them up again when you reopen it',
   "/jev usage - what the router's lookups have used at TypeSafe: requests, tokens, estimated cost",
   '/jev usage money|tokens|limits|hide - show one TypeSafe figure, or hide it',
   '/jev stats - how many lookups picked each model, and the tokens its turns used',
@@ -133,6 +138,8 @@ async function detailRows($: EngineInterface): Promise<string[]> {
 // Sets the status band and answers the routing line, which the top band shows too.
 // The details go after the routing text only when they are set to show here.
 async function show($: EngineInterface): Promise<string> {
+  void remember($)
+
   const line = describe(await read($, mode), await read($, pick), await read($, problem))
 
   if (!(await read($, statusShown))) {
@@ -247,6 +254,59 @@ function enqueue(task: () => Promise<void>): Promise<void> {
   return queue
 }
 
+// Keeps this chat's mode and stats under its session id, so that reopening the
+// chat can pick them up. Re-reads the saved chats first, so chats open at once do
+// not overwrite each other's records.
+async function saveSession($: EngineInterface): Promise<void> {
+  try {
+    const record: JevSessionRecord = {
+      mode: await read($, mode),
+      chosen: await read($, chosen),
+      spend: await read($, spend),
+      routed: await read($, routed),
+      at: await $.clock.now(),
+    }
+    const held = asSessions(await $.store.get('sessions'))
+    await $.store.set('sessions', pruneSessions({ ...held, [await $.session.id()]: record }, SESSIONS_KEPT))
+  } catch {
+    // What a chat keeps is a convenience; the chat works the same without it.
+  }
+}
+
+function remember($: EngineInterface): Promise<void> {
+  return enqueue(() => saveSession($))
+}
+
+// Picks up what this chat had when it was left, if it was left with something to
+// pick up: the routing mode, the mode picked for it, and its stats. A chat that is
+// already in use (the module was reloaded in it) keeps what it has. Returns the
+// routing line to tell the person, or undefined when nothing was picked up. The
+// lookup log is not picked up: it starts off in every chat.
+async function loadSession($: EngineInterface): Promise<string | undefined> {
+  const isFresh =
+    (await read($, mode)) === 'off' &&
+    (await read($, spend)).requests === 0 &&
+    Object.keys(await read($, routed)).length === 0
+
+  if (!isFresh) {
+    return undefined
+  }
+
+  const record = asSessions(await $.store.get('sessions'))[await $.session.id()]
+  const hasStats = record !== undefined && (record.spend.requests > 0 || Object.keys(record.routed).length > 0)
+
+  if (record === undefined || (record.mode === 'off' && !hasStats)) {
+    return undefined
+  }
+
+  await update($, mode, () => record.mode)
+  await update($, chosen, () => record.chosen)
+  await update($, spend, () => record.spend)
+  await update($, routed, () => record.routed)
+
+  return describe(record.mode, null, null)
+}
+
 async function count($: EngineInterface, tokens: Tokens | undefined, isRateLimited: boolean): Promise<void> {
   const add = (held: JevSpend): JevSpend => ({
     requests: held.requests + (isRateLimited ? 0 : 1),
@@ -260,6 +320,7 @@ async function count($: EngineInterface, tokens: Tokens | undefined, isRateLimit
     await $.store.set('spendTotal', total)
     await update($, spend, add)
     await update($, spendAll, () => total)
+    await saveSession($)
   } catch {
     // The figures are for display; the lookup's answer stands without them.
   }
@@ -282,6 +343,7 @@ async function countRouted(
     await $.store.set('routingTotal', total)
     await update($, routed, change)
     await update($, routedAll, () => total)
+    await saveSession($)
   } catch {
     // The stats are for display; routing goes on without them.
   }
@@ -701,7 +763,12 @@ export const register: Register = (on, options) => {
       argumentHint: '[on|off|report|apply|status|usage|stats|debug|debuglog|log|details|topband|statusband|help]',
     })
     await loadDisplay($)
+    const restored = await loadSession($)
     await show($)
+
+    if (restored !== undefined) {
+      $.ui.toast(`Jev picked up where this chat left off: ${restored}`)
+    }
 
     return next(e)
   })

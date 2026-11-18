@@ -2,6 +2,7 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
+import { asSessions, pruneSessions } from '../hooks/display'
 import { decide, parseAnswers, parseModels, parseUsage } from '../hooks/policy'
 
 const MODELS = ['haiku', 'sonnet', 'opus', 'fable']
@@ -74,6 +75,7 @@ const world = (
     files: {} as Record<string, string>,
     isWriteBlocked: false,
     stepUsage: null as ReturnType<typeof usage> | null,
+    toasts: [] as string[],
   }
   mock.env(on, { TYPESAFE_API_KEY: 'test-key', CLAUDE_CONFIG_DIR: '/cfg' })
   on('session.id', () => ({ value: 'test-session' }))
@@ -97,6 +99,11 @@ const world = (
     return { value: undefined }
   })
   on('session.messages', () => ({ value: [] }))
+  on('ui.toast', (_, e) => {
+    seen.toasts.push(e.text)
+
+    return { value: undefined }
+  })
   on('ui.status', (_, e) => {
     seen.statuses.push(e.text)
 
@@ -234,7 +241,7 @@ test('each indicator hides and shows on its own, and the choice is kept', async 
   expect(await ui.find({ type: 'Text', text: /engine/ })).toBeDefined()
   await ui.unmount()
 
-  expect(seen.store).toEqual({ isBandShown: false, isStatusShown: true })
+  expect(seen.store).toEqual({ isBandShown: false, isStatusShown: true, sessions: expect.any(Object) })
 })
 
 test('/jev runs the same commands, and help lists them', async ($, on) => {
@@ -339,6 +346,7 @@ test('a TypeSafe figure and the debug values join the status band, and are kept'
     isDebugShown: false,
     spendTotal: { requests: 2, inputTokens: 10_000_000, outputTokens: 142, rateLimited: 0 },
     routingTotal: { sonnet: { picked: 2, applied: 0, steps: 0, inputTokens: 0, outputTokens: 0 } },
+    sessions: expect.any(Object),
   })
 
   // With the status band hidden, the answer says where the figure would show.
@@ -627,6 +635,128 @@ test('a session starts with the stored stats', async ($, on) => {
   expect(report.slice(0, report.indexOf('All sessions:'))).toContain(
     '  haiku: picked 0, applied 0 · 0 requests, 0 input tokens, 0 output tokens',
   )
+})
+
+const SAVED = {
+  mode: 'apply',
+  chosen: 'apply',
+  spend: { requests: 3, inputTokens: 2000, outputTokens: 150, rateLimited: 0 },
+  routed: { opus: { picked: 2, applied: 2, steps: 4, inputTokens: 9000, outputTokens: 300 } },
+  at: 5,
+} as const
+
+test("a chat's mode and stats are saved under its session id as they change", async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(0) })
+  await $.session.start(SESSION)
+  await command($, 'apply')
+  await $.prompt.submit({ text: 'rename this variable', ...TYPED })
+  await $.turn.start({ text: 'rename this variable', turnId: 't1' })
+  seen.stepUsage = usage(100, 20, 900)
+  await drain($.turn.step({ turnId: 't1', index: 0, model: 'opus', messageCount: 1 }))
+  await seen.clock.settle()
+
+  expect(seen.store.sessions).toEqual({
+    'test-session': {
+      mode: 'apply',
+      chosen: 'apply',
+      spend: { requests: 1, inputTokens: 545, outputTokens: 71, rateLimited: 0 },
+      routed: { haiku: { picked: 1, applied: 1, steps: 1, inputTokens: 1000, outputTokens: 20 } },
+      at: 0,
+    },
+  })
+
+  // Turning it off is saved too, and the stats stay.
+  await command($, 'off')
+  await seen.clock.settle()
+  const saved = (seen.store.sessions as Record<string, { mode: string; spend: { requests: number } }>)[
+    'test-session'
+  ]
+  expect(saved?.mode).toBe('off')
+  expect(saved?.spend.requests).toBe(1)
+})
+
+test('reopening a chat picks up its mode, its picked mode and its stats, and says so', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) }, {
+    isStatusShown: true,
+    sessions: { 'test-session': SAVED },
+  })
+  await $.session.start(SESSION)
+
+  expect(seen.toasts).toEqual(['Jev picked up where this chat left off: Jev: on (apply)'])
+  expect(seen.statuses.at(-1)).toBe('Jev: on (apply)')
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ key: 'mode' }))?.text).toBe('Mode: Apply')
+  expect((await ui.find({ key: 'power' }))?.text).toBe('Turn off')
+  await ui.unmount()
+  expect(await command($, 'usage')).toContain('This session: 3 requests, 2000 input tokens, 150 output tokens')
+  expect(await command($, 'stats')).toContain(
+    '  opus: picked 2, applied 2 · 4 requests, 9000 input tokens, 300 output tokens',
+  )
+  // The lookup log writes prompts to disk, so a reopened chat starts with it off.
+  expect(await command($, 'debuglog')).toContain('Lookup log: off.')
+})
+
+test("a chat with nothing to pick up starts as usual, and another chat's record is not used", async ($, on) => {
+  const other = world(on, { status: 200, text: jevAnswer(1) }, {
+    isStatusShown: true,
+    sessions: { 'another-chat': SAVED },
+  })
+  await $.session.start(SESSION)
+  expect(other.toasts).toEqual([])
+  expect(other.statuses.at(-1)).toBe('Jev: off')
+  expect(await command($, 'usage')).toContain('This session: 0 requests')
+})
+
+test('a chat that was left off with no stats gets no notice', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) }, {
+    isStatusShown: true,
+    sessions: {
+      'test-session': {
+        mode: 'off',
+        chosen: 'report',
+        spend: { requests: 0, inputTokens: 0, outputTokens: 0, rateLimited: 0 },
+        routed: {},
+        at: 5,
+      },
+    },
+  })
+  await $.session.start(SESSION)
+
+  expect(seen.toasts).toEqual([])
+  expect(seen.statuses.at(-1)).toBe('Jev: off')
+})
+
+test('a chat already in use keeps what it has when the module reloads', async ($, on) => {
+  const seen = world(on, { status: 200, text: jevAnswer(1) }, {
+    isStatusShown: true,
+    sessions: { 'test-session': SAVED },
+  })
+  await command($, 'report')
+  await $.session.start(SESSION)
+
+  expect(seen.toasts).toEqual([])
+  expect(seen.statuses.at(-1)).toBe('Jev: on (report)')
+})
+
+test('the saved chats are limited to the newest, and a record that is not whole is dropped', () => {
+  const record = (at: number) => ({ ...SAVED, at })
+  const many = Object.fromEntries(Array.from({ length: 60 }, (_, index) => [`chat-${index}`, record(index)]))
+
+  const kept = pruneSessions(asSessions(many), 50)
+  expect(Object.keys(kept).length).toBe(50)
+  expect(kept['chat-59']).toBeDefined()
+  expect(kept['chat-10']).toBeDefined()
+  expect(kept['chat-9']).toBeUndefined()
+  expect(pruneSessions(asSessions({ one: record(1) }), 50)).toEqual({ one: record(1) })
+
+  const messy = asSessions({
+    whole: record(1),
+    noMode: { ...record(1), mode: 'maybe' },
+    noSpend: { ...record(1), spend: { requests: -1 } },
+    notAnObject: 'x',
+  })
+  expect(Object.keys(messy)).toEqual(['whole'])
+  expect(asSessions(null)).toEqual({})
 })
 
 test('a session starts with the stored choice', async ($, on) => {

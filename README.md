@@ -39,7 +39,7 @@ To try it without installing, start a session with `claude --plugin-dir "<path t
 
 The band above the prompt shows the state and two buttons. The mode button reads **Mode: Report only** or **Mode: Apply** and flips between the two when clicked. **Turn on** / **Turn off** switches routing on in that mode, or off. Flipping the mode while routing is off only picks it; while it is on, it switches straight away.
 
-Routing is off at the start of every session, so nothing is sent to TypeSafe until you turn it on in that session.
+Routing is off in every new chat, so nothing is sent to TypeSafe until you turn it on in that chat. A chat you reopen picks up where it left off (see "Reopening a chat" below).
 
 Everything is also a `/jev` command:
 
@@ -56,7 +56,7 @@ Everything is also a `/jev` command:
 | `/jev stats show` / `/jev stats hide` | Shows those stats as rows on the band, or hides them (hidden by default) |
 | `/jev debug show` / `/jev debug hide` | Shows Jev's raw answer for the last lookup, or hides it (hidden by default) |
 | `/jev details top` / `/jev details status` | Where the debug values, the usage figure and the stats show: as rows on the top band (the default), or after the routing text on the status line |
-| `/jev debuglog on` / `/jev debuglog off` | Starts or stops the lookup log (off by default, and off again in every new session). See below, since it writes your prompts to a file |
+| `/jev debuglog on` / `/jev debuglog off` | Starts or stops the lookup log (off by default, and off again in every new or reopened chat). See below, since it writes your prompts to a file |
 | `/jev debuglog clear` | Empties the log. `/jev debuglog` alone says whether it is on and where the file is |
 | `/jev log [n]` | Shows the last `n` logged lookups in the chat (5 by default, 20 at most) |
 | `/jev topband show` / `/jev topband hide` | Shows or hides the band above the prompt (shown by default) |
@@ -67,7 +67,7 @@ The same words without the slash (`jev on`, `jev off` and so on) also work when 
 
 The band and the status line show the same routing text, for example `Jev: off`, `Jev: on (report) → sonnet` or `Jev: on (apply) → haiku`. The arrow points at the model Jev picked: in report mode the one it would pick, in apply mode the one the turn runs on. A failed lookup reads `Jev: on (apply) · no pick: <reason>`.
 
-The debug values, the usage figure and the stats are the details. By default they show as rows under the routing text on the top band, which is full width and wraps. The desktop app draws the status line as one short line beside the model name, so a long one is cut off with "…" and shown in full only when you hover over it; it does not show line breaks. If you prefer the status line anyway, `/jev details status` puts the details after the routing text there, separated by `|`. What is shown is remembered across sessions. Routing itself always starts off in a new session.
+The debug values, the usage figure and the stats are the details. By default they show as rows under the routing text on the top band, which is full width and wraps. The desktop app draws the status line as one short line beside the model name, so a long one is cut off with "…" and shown in full only when you hover over it; it does not show line breaks. If you prefer the status line anyway, `/jev details status` puts the details after the routing text there, separated by `|`. What is shown is remembered across sessions. Routing itself starts off in a new chat.
 
 ### Usage
 
@@ -119,9 +119,20 @@ All sessions:
 
 `/jev stats show` adds two rows to the details: `Picked this session: haiku 5 · sonnet 12` and `Tokens in/out by model, apply mode: haiku 10.2k/1.1k · sonnet 80k/5.2k`. The `/jev stats` totals are kept in the mod's saved data and add up across sessions, including ones open at the same time.
 
+### Reopening a chat
+
+Each chat keeps its own routing state, under its session id, in the mod's saved data. When you reopen a chat, the mod picks it up again and shows a short notice, `Jev picked up where this chat left off: Jev: on (apply)`. What comes back:
+
+- the routing mode (on or off, report or apply) and the mode last picked, so the band reads as you left it;
+- the usage and routing stats counted in that chat, so `/jev usage` and `/jev stats` carry on from their last figures under "This session". The all-sessions totals are kept separately and are not affected.
+
+What does not come back: the lookup log, which starts off in every chat because it writes your prompts to a file, and the last pick shown on the band, which is shown again after your next prompt. The display choices (which bands show, where the details show, the usage figure and the stats rows) are the same in every chat, whether new or reopened.
+
+A new chat has no record, so it starts with routing off. The mod keeps the newest 50 chats and forgets older ones. A chat you reopen with a different session id, such as a fork or a copy, starts as a new one. The mod only knows a chat by its session id, so if your Claude app gave a reopened chat a new id, nothing would be found for it. A reopened chat that already has routing on (after `/reload-plugins`, say) keeps what it has instead.
+
 ### Lookup log
 
-`/jev debuglog on` starts a log of every lookup the router makes, so you can see exactly what was asked, what Jev answered and which model the policy chose. It is **off by default and starts off again in every new session**, because it writes what you type to a file. While it is on, the top band says `· logging`.
+`/jev debuglog on` starts a log of every lookup the router makes, so you can see exactly what was asked, what Jev answered and which model the policy chose. It is **off by default and starts off again in every new or reopened chat**, because it writes what you type to a file. While it is on, the top band says `· logging`.
 
 Each lookup adds one line of JSON to `jev-router/lookups.jsonl` in your Claude config folder (`~/.claude`, or `CLAUDE_CONFIG_DIR` if you set it). It is not written into any project, so it cannot be committed by accident. A line has:
 
@@ -169,7 +180,7 @@ In apply mode the mod changes the model on each request of that turn's main loop
 
 ## Things to know
 
-- **Files the mod writes:** the mod's saved data (display choices and the usage and routing totals, as numbers) under `~/.claude/plugins/store/`, and, only while you have turned the lookup log on, the log file above. It reads `TYPESAFE_API_KEY`, and the home and config folder variables to find the log; `claude plugin validate .` lists every environment variable and file call it makes.
+- **Files the mod writes:** the mod's saved data (display choices, the usage and routing totals, and each recent chat's mode and counts, all as numbers and words, never prompts) under `~/.claude/plugins/store/`, and, only while you have turned the lookup log on, the log file above. It reads `TYPESAFE_API_KEY`, and the home and config folder variables to find the log; `claude plugin validate .` lists every environment variable and file call it makes.
 - **What is sent to TypeSafe:** while routing is on, each prompt you type (its first 4,000 characters) and the text of the last 6 messages (600 characters each) go to `api.typesafe.ai`. Nothing is sent while it is off. Check that this fits your organization's data policy.
 - **Prompt cache:** each model keeps its own prompt cache. In a long conversation, a turn routed to a different model re-reads the conversation without that cache, which can cost more than the cheaper model saves. Routing pays off most in short sessions or when most turns land on the same model.
 - **Latency:** report mode does not hold the prompt back. Apply mode waits for Jev before the turn starts; the calls measured while building this took about 0.1 to 0.3 seconds.

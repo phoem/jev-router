@@ -8,6 +8,7 @@ import type {
   JevModelStat,
   JevPick,
   JevRouted,
+  JevSessionRecord,
   JevSpend,
   JevUsageShown,
 } from '../types'
@@ -226,4 +227,45 @@ export const logLine = (entry: JevLogEntry): string => {
     entry.inputTokens === undefined ? '' : ` · ${entry.inputTokens} in/${entry.outputTokens ?? 0} out`
 
   return `${clock} ${entry.mode} → ${entry.model} (level ${entry.level ?? '?'}) · depth ${entry.depth.toFixed(2)}${confidence} · stakes ${(entry.stakes ?? 0).toFixed(2)} · follow-up ${(entry.followUp ?? 0).toFixed(2)}${tokens} · ${took} · ${snippet}`
+}
+
+// The saved chats read back: a record that is not whole is left out, so one bad
+// entry does not lose the rest.
+export const asSessions = (value: unknown): Record<string, JevSessionRecord> => {
+  const kept: Record<string, JevSessionRecord> = {}
+
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return kept
+  }
+
+  for (const [id, held] of Object.entries(value)) {
+    const record = held as Partial<Record<keyof JevSessionRecord, unknown>> | null
+    const { mode, chosen, at } = record ?? {}
+    const spend = asSpend(record?.spend)
+    const routed = asRouted(record?.routed)
+    const isMode = mode === 'off' || mode === 'report' || mode === 'apply'
+    const isChoice = chosen === null || chosen === 'report' || chosen === 'apply'
+
+    if (isMode && isChoice && spend !== undefined && routed !== undefined && typeof at === 'number') {
+      kept[id] = { mode, chosen, spend, routed, at }
+    }
+  }
+
+  return kept
+}
+
+// The newest `keep` chats, so the saved data does not grow with every chat ever opened.
+export const pruneSessions = (
+  held: Record<string, JevSessionRecord>,
+  keep: number,
+): Record<string, JevSessionRecord> => {
+  const ids = Object.keys(held)
+
+  if (ids.length <= keep) {
+    return held
+  }
+
+  const newest = ids.sort((a, b) => (held[b]?.at ?? 0) - (held[a]?.at ?? 0)).slice(0, keep)
+
+  return Object.fromEntries(newest.flatMap(id => (held[id] === undefined ? [] : [[id, held[id]]])))
 }

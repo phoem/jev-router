@@ -45,6 +45,17 @@ export type JevModelStat = {
 // Routing stats by model, keyed by the model name from the `models` setting.
 export type JevRouted = Record<string, JevModelStat>
 
+// What one chat has when it is left, kept under its session id so that reopening
+// the chat picks up where it was: the routing mode, the mode picked for it, and
+// the usage and routing stats counted in it. `at` is when it was last saved.
+export type JevSessionRecord = {
+  mode: JevMode
+  chosen: JevChoice | null
+  spend: JevSpend
+  routed: JevRouted
+  at: number
+}
+
 // One line of the lookup log, one lookup each. A lookup that failed has `error`
 // and no answers; the prompt is as sent to TypeSafe, cut to its first 4,000 characters.
 export type JevLogEntry = {
